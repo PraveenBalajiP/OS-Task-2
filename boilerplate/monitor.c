@@ -1,28 +1,28 @@
 /*
  * monitor.c - Multi-Container Memory Monitor (Linux Kernel Module)
- */
-
+*/
+#include <linux/timer.h>
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/jiffies.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/fs.h>
-#include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/mm.h>
-#include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pid.h>
 #include <linux/sched/signal.h>
 #include <linux/slab.h>
-#include <linux/timer.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
 
 #include "monitor_ioctl.h"
 
 #define DEVICE_NAME "container_monitor"
-#define CHECK_INTERVAL_SEC 1
+#define CHECK_INTERVAL_MS 1000   // 1 second
 
-/* ===================== TODO 1 ===================== */
+/* ===================== STRUCT ===================== */
 
 struct monitored_entry {
     pid_t pid;
@@ -33,7 +33,7 @@ struct monitored_entry {
     struct list_head list;
 };
 
-/* ===================== TODO 2 ===================== */
+/* ===================== GLOBAL LIST ===================== */
 
 static LIST_HEAD(monitored_list);
 static DEFINE_MUTEX(monitored_lock);
@@ -45,7 +45,7 @@ static dev_t dev_num;
 static struct cdev c_dev;
 static struct class *cl;
 
-/* ===================== RSS ===================== */
+/* ===================== RSS FUNCTION ===================== */
 
 static long get_rss_bytes(pid_t pid)
 {
@@ -67,8 +67,8 @@ static long get_rss_bytes(pid_t pid)
         rss_pages = get_mm_rss(mm);
         mmput(mm);
     }
-    put_task_struct(task);
 
+    put_task_struct(task);
     return rss_pages * PAGE_SIZE;
 }
 
@@ -94,7 +94,7 @@ static void kill_process(const char *container_id,
     rcu_read_lock();
     task = pid_task(find_vpid(pid), PIDTYPE_PID);
     if (task)
-        send_sig(SIGKILL, task, 1);
+        send_sig(SIGKILL, task, 0);   // safer
     rcu_read_unlock();
 
     printk(KERN_WARNING
@@ -102,7 +102,7 @@ static void kill_process(const char *container_id,
            container_id, pid, rss_bytes, limit_bytes);
 }
 
-/* ===================== TODO 3 ===================== */
+/* ===================== TIMER ===================== */
 
 static void timer_callback(struct timer_list *t)
 {
@@ -144,10 +144,12 @@ static void timer_callback(struct timer_list *t)
 
     mutex_unlock(&monitored_lock);
 
-    mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
+    /* Restart timer */
+    mod_timer(&monitor_timer,
+              jiffies + msecs_to_jiffies(CHECK_INTERVAL_MS));
 }
 
-/* ===================== TODO 4 + 5 ===================== */
+/* ===================== IOCTL ===================== */
 
 static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
@@ -157,10 +159,16 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     if (cmd != MONITOR_REGISTER && cmd != MONITOR_UNREGISTER)
         return -EINVAL;
 
-    if (copy_from_user(&req, (struct monitor_request __user *)arg, sizeof(req)))
+    if (copy_from_user(&req,
+                       (struct monitor_request __user *)arg,
+                       sizeof(req)))
         return -EFAULT;
 
+    /* ================= REGISTER ================= */
     if (cmd == MONITOR_REGISTER) {
+
+        if (req.soft_limit_bytes > req.hard_limit_bytes)
+            return -EINVAL;
 
         entry = kmalloc(sizeof(*entry), GFP_KERNEL);
         if (!entry)
@@ -170,8 +178,13 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         entry->soft_limit = req.soft_limit_bytes;
         entry->hard_limit = req.hard_limit_bytes;
         entry->soft_triggered = 0;
-        strncpy(entry->container_id, req.container_id, sizeof(entry->container_id) - 1);
+
+        strncpy(entry->container_id,
+                req.container_id,
+                sizeof(entry->container_id) - 1);
         entry->container_id[sizeof(entry->container_id) - 1] = '\0';
+
+        INIT_LIST_HEAD(&entry->list);   // IMPORTANT
 
         mutex_lock(&monitored_lock);
         list_add(&entry->list, &monitored_list);
@@ -180,7 +193,7 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         return 0;
     }
 
-    /* UNREGISTER */
+    /* ================= UNREGISTER ================= */
 
     mutex_lock(&monitored_lock);
 
@@ -197,12 +210,14 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     return -ENOENT;
 }
 
-/* ===================== INIT ===================== */
+/* ===================== FILE OPS ===================== */
 
 static struct file_operations fops = {
     .owner = THIS_MODULE,
     .unlocked_ioctl = monitor_ioctl,
 };
+
+/* ===================== INIT ===================== */
 
 static int __init monitor_init(void)
 {
@@ -227,6 +242,7 @@ static int __init monitor_init(void)
     }
 
     cdev_init(&c_dev, &fops);
+
     if (cdev_add(&c_dev, dev_num, 1) < 0) {
         device_destroy(cl, dev_num);
         class_destroy(cl);
@@ -234,19 +250,22 @@ static int __init monitor_init(void)
         return -1;
     }
 
+    /* Setup timer */
     timer_setup(&monitor_timer, timer_callback, 0);
-    mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
+    mod_timer(&monitor_timer,
+              jiffies + msecs_to_jiffies(CHECK_INTERVAL_MS));
 
     printk(KERN_INFO "[container_monitor] Module loaded\n");
     return 0;
 }
 
-/* ===================== TODO 6 ===================== */
+/* ===================== EXIT ===================== */
 
 static void __exit monitor_exit(void)
 {
     struct monitored_entry *entry, *tmp;
 
+    /* Proper timer cleanup */
     timer_shutdown_sync(&monitor_timer);
 
     mutex_lock(&monitored_lock);
@@ -271,3 +290,5 @@ module_exit(monitor_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Supervised multi-container memory monitor");
+
+
