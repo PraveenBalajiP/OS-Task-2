@@ -40,6 +40,7 @@ typedef struct {
 
 container_t containers[MAX_CONTAINERS];
 int container_count = 0;
+int monitor_fd = -1;
 
 /* ================= FIND ================= */
 
@@ -73,6 +74,10 @@ int child_fn(void *arg) {
 
     dup2(cfg->log_fd, STDOUT_FILENO);
     dup2(cfg->log_fd, STDERR_FILENO);
+
+    /* Disable buffering for logs */
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
 
     execl("/bin/sh", "sh", "-c", cfg->command, NULL);
 
@@ -117,15 +122,43 @@ void sigchld_handler(int sig) {
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
         for (int i = 0; i < container_count; i++) {
             if (containers[i].pid == pid) {
-                strcpy(containers[i].state, "stopped");
+                if (WIFEXITED(status))
+                    strcpy(containers[i].state, "exited");
+                else if (WIFSIGNALED(status))
+                    strcpy(containers[i].state, "killed");
+                else
+                    strcpy(containers[i].state, "stopped");
             }
         }
     }
 }
 
+void shutdown_handler(int sig) {
+    printf("Shutting down supervisor...\n");
+
+    for (int i = 0; i < container_count; i++) {
+        if (strcmp(containers[i].state, "running") == 0) {
+            kill(containers[i].pid, SIGTERM);
+        }
+    }
+
+    unlink(CONTROL_PATH);
+
+    if (monitor_fd >= 0)
+        close(monitor_fd);
+
+    exit(0);
+}
+
 /* ================= COMMAND ================= */
 
-typedef enum { CMD_START, CMD_RUN, CMD_PS, CMD_STOP } cmd_t;
+typedef enum {
+    CMD_START,
+    CMD_RUN,
+    CMD_PS,
+    CMD_STOP,
+    CMD_LOGS
+} cmd_t;
 
 typedef struct {
     cmd_t type;
@@ -142,9 +175,11 @@ void run_supervisor() {
 
     mkdir(LOG_DIR, 0755);
 
-    int monitor_fd = open("/dev/container_monitor", O_RDWR);
+    monitor_fd = open("/dev/container_monitor", O_RDWR);
 
     signal(SIGCHLD, sigchld_handler);
+    signal(SIGINT, shutdown_handler);
+    signal(SIGTERM, shutdown_handler);
 
     int server = socket(AF_UNIX, SOCK_STREAM, 0);
 
@@ -179,10 +214,15 @@ void run_supervisor() {
             void *stack = malloc(STACK_SIZE);
 
             pid_t pid = clone(child_fn, stack + STACK_SIZE,
-                              CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
+                              CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
                               cfg);
 
-            /* Register with kernel monitor */
+            if (pid < 0) {
+                perror("clone failed");
+                write(client, "CLONE FAILED\n", 13);
+                continue;
+            }
+
             struct monitor_request mreq = {
                 .pid = pid,
                 .soft_limit_bytes = req.soft,
@@ -193,7 +233,6 @@ void run_supervisor() {
 
             close(pipefd[1]);
 
-            /* Logging thread */
             pipe_ctx_t *pctx = malloc(sizeof(*pctx));
             pctx->fd = pipefd[0];
             strcpy(pctx->id, req.id);
@@ -202,7 +241,6 @@ void run_supervisor() {
             pthread_create(&tid, NULL, pipe_reader, pctx);
             pthread_detach(tid);
 
-            /* Store metadata */
             container_t *c = &containers[container_count++];
             strcpy(c->id, req.id);
             c->pid = pid;
@@ -218,22 +256,31 @@ void run_supervisor() {
             int pipefd[2];
             pipe(pipefd);
 
-            child_config_t cfg;
-            strcpy(cfg.id, req.id);
-            strcpy(cfg.rootfs, req.rootfs);
-            strcpy(cfg.command, req.command);
-            cfg.log_fd = pipefd[1];
+            child_config_t *cfg = malloc(sizeof(*cfg));
+            strcpy(cfg->id, req.id);
+            strcpy(cfg->rootfs, req.rootfs);
+            strcpy(cfg->command, req.command);
+            cfg->log_fd = pipefd[1];
 
             void *stack = malloc(STACK_SIZE);
 
             pid_t pid = clone(child_fn, stack + STACK_SIZE,
-                              CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
-                              &cfg);
+                              CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
+                              cfg);
+
+            if (pid < 0) {
+                perror("clone failed");
+                write(client, "CLONE FAILED\n", 13);
+                continue;
+            }
 
             close(pipefd[1]);
 
             int status;
             waitpid(pid, &status, 0);
+
+            free(cfg);
+            free(stack);
 
             char resp[64];
             sprintf(resp, "EXIT %d\n", WEXITSTATUS(status));
@@ -273,7 +320,32 @@ void run_supervisor() {
                 if (strcmp(c->state, "running") == 0)
                     kill(c->pid, SIGKILL);
 
+                struct monitor_request mreq = {0};
+                mreq.pid = c->pid;
+                ioctl(monitor_fd, MONITOR_UNREGISTER, &mreq);
+
+                strcpy(c->state, "stopped");
+
                 write(client, "STOPPED\n", 8);
+            }
+        }
+
+        /* ---------- LOGS ---------- */
+        else if (req.type == CMD_LOGS) {
+
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s/%s.log", LOG_DIR, req.id);
+
+            int fd = open(path, O_RDONLY);
+            if (fd < 0) {
+                write(client, "NO LOGS\n", 8);
+            } else {
+                char buf[512];
+                int n;
+                while ((n = read(fd, buf, sizeof(buf))) > 0) {
+                    write(client, buf, n);
+                }
+                close(fd);
             }
         }
 
@@ -291,7 +363,10 @@ int send_request(request_t *req) {
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, CONTROL_PATH);
 
-    connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("connect");
+        return -1;
+    }
 
     write(sock, req, sizeof(*req));
 
@@ -325,6 +400,8 @@ int main(int argc, char *argv[]) {
         req.type = CMD_PS;
     else if (strcmp(argv[1], "stop") == 0)
         req.type = CMD_STOP;
+    else if (strcmp(argv[1], "logs") == 0)
+        req.type = CMD_LOGS;
 
     if (req.type != CMD_PS) {
         strcpy(req.id, argv[2]);
