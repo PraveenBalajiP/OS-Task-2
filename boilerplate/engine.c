@@ -2,7 +2,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
@@ -17,366 +16,253 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "monitor_ioctl.h"
+/* ================= UI COLORS ================= */
 
-/* ================= CONFIG ================= */
+#define RESET   "\033[0m"
+#define GREEN   "\033[32m"
+#define RED     "\033[31m"
+#define YELLOW  "\033[33m"
+#define CYAN    "\033[36m"
+#define BOLD    "\033[1m"
 
-#define STACK_SIZE (1024 * 1024)
-#define CONTROL_PATH "/tmp/mini_runtime.sock"
+/* ================= CORE ================= */
+
+#define SOCK_PATH "/tmp/mini_runtime.sock"
 #define LOG_DIR "logs"
+#define STACK_SIZE (1024 * 1024)
 
-#define MAX_CONTAINERS 100
-#define CONTAINER_ID_LEN 32
-#define LOG_CHUNK_SIZE 4096
+#define MAX_CONTAINERS 64
+#define ID_LEN 32
 
-/* ================= TYPES ================= */
+/* ================= PROTOCOL ================= */
 
 typedef struct {
-    char id[CONTAINER_ID_LEN];
+    int cmd;
+    char id[ID_LEN];
+    char rootfs[PATH_MAX];
+    char command[256];
+} request_t;
+
+typedef struct {
+    int status;
+    char msg[256];
+} response_t;
+
+enum {
+    CMD_START = 1,
+    CMD_PS,
+    CMD_STOP,
+    CMD_LOGS
+};
+
+/* ================= CONTAINERS ================= */
+
+typedef struct {
+    char id[ID_LEN];
     pid_t pid;
-    char state[16];
-    time_t start_time;
+    time_t start;
+    int alive;
 } container_t;
 
-container_t containers[MAX_CONTAINERS];
-int container_count = 0;
-int monitor_fd = -1;
+static container_t containers[MAX_CONTAINERS];
+static int container_count = 0;
 
-/* ================= FIND ================= */
+/* ================= UTIL ================= */
 
-container_t* find_container(const char *id) {
-    for (int i = 0; i < container_count; i++) {
-        if (strcmp(containers[i].id, id) == 0)
+static container_t* find(const char *id) {
+    for (int i = 0; i < container_count; i++)
+        if (!strcmp(containers[i].id, id))
             return &containers[i];
-    }
     return NULL;
+}
+
+static void uptime(time_t s, char *out) {
+    int t = time(NULL) - s;
+    sprintf(out, "%02d:%02d:%02d", t/3600, (t%3600)/60, t%60);
+}
+
+static const char* state_color(int alive) {
+    return alive ? GREEN "RUNNING" RESET : RED "STOPPED" RESET;
 }
 
 /* ================= CHILD ================= */
 
 typedef struct {
-    char id[CONTAINER_ID_LEN];
+    char id[ID_LEN];
     char rootfs[PATH_MAX];
-    char command[256];
-    int log_fd;
-} child_config_t;
+    char cmd[256];
+} child_t;
 
-int child_fn(void *arg) {
-    child_config_t *cfg = arg;
+static int child_fn(void *arg) {
+    child_t *c = arg;
 
-    sethostname(cfg->id, strlen(cfg->id));
+    sethostname(c->id, strlen(c->id));
 
-    chroot(cfg->rootfs);
+    if (chroot(c->rootfs) != 0) {
+        perror("chroot");
+        return 1;
+    }
+
     chdir("/");
-
     mkdir("/proc", 0555);
     mount("proc", "/proc", "proc", 0, NULL);
 
-    dup2(cfg->log_fd, STDOUT_FILENO);
-    dup2(cfg->log_fd, STDERR_FILENO);
+    execl("/bin/sh", "sh", "-c", c->cmd, NULL);
 
-    /* Disable buffering for logs */
-    setbuf(stdout, NULL);
-    setbuf(stderr, NULL);
-
-    execl("/bin/sh", "sh", "-c", cfg->command, NULL);
-
-    perror("exec failed");
+    perror("exec");
     return 1;
 }
 
-/* ================= LOG THREAD ================= */
+/* ================= SAFE READ ================= */
 
-typedef struct {
-    int fd;
-    char id[CONTAINER_ID_LEN];
-} pipe_ctx_t;
-
-void *pipe_reader(void *arg) {
-    pipe_ctx_t *ctx = arg;
-
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s.log", LOG_DIR, ctx->id);
-
-    int logfd = open(path, O_CREAT | O_WRONLY | O_APPEND, 0644);
-
-    char buf[LOG_CHUNK_SIZE];
-    int n;
-
-    while ((n = read(ctx->fd, buf, sizeof(buf))) > 0) {
-        write(logfd, buf, n);
+static int read_full(int fd, void *buf, size_t len) {
+    size_t got = 0;
+    while (got < len) {
+        int r = read(fd, buf + got, len - got);
+        if (r <= 0) return -1;
+        got += r;
     }
-
-    close(logfd);
-    close(ctx->fd);
-    free(ctx);
-    return NULL;
+    return 0;
 }
-
-/* ================= SIGNAL ================= */
-
-void sigchld_handler(int sig) {
-    int status;
-    pid_t pid;
-
-    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-        for (int i = 0; i < container_count; i++) {
-            if (containers[i].pid == pid) {
-                if (WIFEXITED(status))
-                    strcpy(containers[i].state, "exited");
-                else if (WIFSIGNALED(status))
-                    strcpy(containers[i].state, "killed");
-                else
-                    strcpy(containers[i].state, "stopped");
-            }
-        }
-    }
-}
-
-void shutdown_handler(int sig) {
-    printf("Shutting down supervisor...\n");
-
-    for (int i = 0; i < container_count; i++) {
-        if (strcmp(containers[i].state, "running") == 0) {
-            kill(containers[i].pid, SIGTERM);
-        }
-    }
-
-    unlink(CONTROL_PATH);
-
-    if (monitor_fd >= 0)
-        close(monitor_fd);
-
-    exit(0);
-}
-
-/* ================= COMMAND ================= */
-
-typedef enum {
-    CMD_START,
-    CMD_RUN,
-    CMD_PS,
-    CMD_STOP,
-    CMD_LOGS
-} cmd_t;
-
-typedef struct {
-    cmd_t type;
-    char id[CONTAINER_ID_LEN];
-    char rootfs[PATH_MAX];
-    char command[256];
-    unsigned long soft;
-    unsigned long hard;
-} request_t;
 
 /* ================= SUPERVISOR ================= */
 
-void run_supervisor() {
+static void supervisor() {
 
     mkdir(LOG_DIR, 0755);
 
-    monitor_fd = open("/dev/container_monitor", O_RDWR);
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
 
-    signal(SIGCHLD, sigchld_handler);
-    signal(SIGINT, shutdown_handler);
-    signal(SIGTERM, shutdown_handler);
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    strcpy(a.sun_path, SOCK_PATH);
 
-    int server = socket(AF_UNIX, SOCK_STREAM, 0);
+    unlink(SOCK_PATH);
+    bind(s, (struct sockaddr*)&a, sizeof(a));
+    listen(s, 10);
 
-    struct sockaddr_un addr = {0};
-    addr.sun_family = AF_UNIX;
-    strcpy(addr.sun_path, CONTROL_PATH);
-
-    unlink(CONTROL_PATH);
-    bind(server, (struct sockaddr *)&addr, sizeof(addr));
-    listen(server, 5);
-
-    printf("Supervisor running...\n");
+    printf(BOLD CYAN "\n[SUPERVISOR STARTED]\n" RESET);
 
     while (1) {
-        int client = accept(server, NULL, NULL);
 
-        request_t req;
-        read(client, &req, sizeof(req));
+        int c = accept(s, NULL, NULL);
 
-        /* ---------- START ---------- */
-        if (req.type == CMD_START) {
+        request_t r;
+        response_t res;
 
-            int pipefd[2];
-            pipe(pipefd);
-
-            child_config_t *cfg = malloc(sizeof(*cfg));
-            strcpy(cfg->id, req.id);
-            strcpy(cfg->rootfs, req.rootfs);
-            strcpy(cfg->command, req.command);
-            cfg->log_fd = pipefd[1];
-
-            void *stack = malloc(STACK_SIZE);
-
-            pid_t pid = clone(child_fn, stack + STACK_SIZE,
-                              CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
-                              cfg);
-
-            if (pid < 0) {
-                perror("clone failed");
-                write(client, "CLONE FAILED\n", 13);
-                continue;
-            }
-
-            struct monitor_request mreq = {
-                .pid = pid,
-                .soft_limit_bytes = req.soft,
-                .hard_limit_bytes = req.hard
-            };
-            strcpy(mreq.container_id, req.id);
-            ioctl(monitor_fd, MONITOR_REGISTER, &mreq);
-
-            close(pipefd[1]);
-
-            pipe_ctx_t *pctx = malloc(sizeof(*pctx));
-            pctx->fd = pipefd[0];
-            strcpy(pctx->id, req.id);
-
-            pthread_t tid;
-            pthread_create(&tid, NULL, pipe_reader, pctx);
-            pthread_detach(tid);
-
-            container_t *c = &containers[container_count++];
-            strcpy(c->id, req.id);
-            c->pid = pid;
-            strcpy(c->state, "running");
-            c->start_time = time(NULL);
-
-            write(client, "STARTED\n", 8);
+        if (read_full(c, &r, sizeof(r)) < 0) {
+            close(c);
+            continue;
         }
 
-        /* ---------- RUN ---------- */
-        else if (req.type == CMD_RUN) {
-
-            int pipefd[2];
-            pipe(pipefd);
-
-            child_config_t *cfg = malloc(sizeof(*cfg));
-            strcpy(cfg->id, req.id);
-            strcpy(cfg->rootfs, req.rootfs);
-            strcpy(cfg->command, req.command);
-            cfg->log_fd = pipefd[1];
+        /* ================= START ================= */
+        if (r.cmd == CMD_START) {
 
             void *stack = malloc(STACK_SIZE);
+            child_t *ch = malloc(sizeof(child_t));
 
-            pid_t pid = clone(child_fn, stack + STACK_SIZE,
-                              CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
-                              cfg);
+            strcpy(ch->id, r.id);
+            strcpy(ch->rootfs, r.rootfs);
+            strcpy(ch->cmd, r.command);
 
-            if (pid < 0) {
-                perror("clone failed");
-                write(client, "CLONE FAILED\n", 13);
-                continue;
-            }
+            pid_t pid = clone(child_fn,
+                              stack + STACK_SIZE,
+                              CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
+                              ch);
 
-            close(pipefd[1]);
+            container_t *ct = &containers[container_count++];
+            strcpy(ct->id, r.id);
+            ct->pid = pid;
+            ct->start = time(NULL);
+            ct->alive = 1;
 
-            int status;
-            waitpid(pid, &status, 0);
+            printf(GREEN "[OK]" RESET " started %s pid=%d\n", r.id, pid);
 
-            free(cfg);
-            free(stack);
-
-            char resp[64];
-            sprintf(resp, "EXIT %d\n", WEXITSTATUS(status));
-
-            write(client, resp, strlen(resp));
+            sprintf(res.msg, "started %s", r.id);
+            write(c, &res, sizeof(res));
         }
 
-        /* ---------- PS ---------- */
-        else if (req.type == CMD_PS) {
+        /* ================= PS ================= */
+        else if (r.cmd == CMD_PS) {
 
-            char buf[1024] = "";
+            printf(BOLD CYAN "\n%-12s %-8s %-10s %-10s\n" RESET,
+                   "ID", "PID", "STATE", "UPTIME");
 
             for (int i = 0; i < container_count; i++) {
-                char line[128];
-                sprintf(line, "%s | PID:%d | %s\n",
-                        containers[i].id,
-                        containers[i].pid,
-                        containers[i].state);
 
-                strcat(buf, line);
+                char up[32];
+                uptime(containers[i].start, up);
+
+                printf("%-12s %-8d %-10s %-10s\n",
+                       containers[i].id,
+                       containers[i].pid,
+                       state_color(containers[i].alive),
+                       up);
             }
 
-            write(client, buf, strlen(buf));
+            printf("\n");
         }
 
-        /* ---------- STOP ---------- */
-        else if (req.type == CMD_STOP) {
+        /* ================= STOP ================= */
+        else if (r.cmd == CMD_STOP) {
 
-            container_t *c = find_container(req.id);
+            container_t *ct = find(r.id);
 
-            if (!c) {
-                write(client, "NOT FOUND\n", 10);
+            if (!ct) {
+                printf(RED "[ERROR] not found\n" RESET);
             } else {
-                kill(c->pid, SIGTERM);
-                sleep(1);
+                kill(ct->pid, SIGKILL);
+                ct->alive = 0;
 
-                if (strcmp(c->state, "running") == 0)
-                    kill(c->pid, SIGKILL);
-
-                struct monitor_request mreq = {0};
-                mreq.pid = c->pid;
-                ioctl(monitor_fd, MONITOR_UNREGISTER, &mreq);
-
-                strcpy(c->state, "stopped");
-
-                write(client, "STOPPED\n", 8);
+                printf(YELLOW "[STOPPED]" RESET " %s\n", r.id);
             }
         }
 
-        /* ---------- LOGS ---------- */
-        else if (req.type == CMD_LOGS) {
+        /* ================= LOGS ================= */
+        else if (r.cmd == CMD_LOGS) {
 
-            char path[PATH_MAX];
-            snprintf(path, sizeof(path), "%s/%s.log", LOG_DIR, req.id);
+            char p[PATH_MAX];
+            sprintf(p, "%s/%s.log", LOG_DIR, r.id);
 
-            int fd = open(path, O_RDONLY);
+            int fd = open(p, O_RDONLY);
+
             if (fd < 0) {
-                write(client, "NO LOGS\n", 8);
+                printf(RED "no logs\n" RESET);
             } else {
-                char buf[512];
+                char b[512];
                 int n;
-                while ((n = read(fd, buf, sizeof(buf))) > 0) {
-                    write(client, buf, n);
-                }
+                while ((n = read(fd, b, sizeof(b))) > 0)
+                    write(1, b, n);
                 close(fd);
             }
         }
 
-        close(client);
+        close(c);
     }
 }
 
 /* ================= CLIENT ================= */
 
-int send_request(request_t *req) {
+static void send_req(request_t *r) {
 
-    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
 
-    struct sockaddr_un addr = {0};
-    addr.sun_family = AF_UNIX;
-    strcpy(addr.sun_path, CONTROL_PATH);
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    strcpy(a.sun_path, SOCK_PATH);
 
-    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("connect");
-        return -1;
-    }
+    connect(s, (struct sockaddr*)&a, sizeof(a));
 
-    write(sock, req, sizeof(*req));
+    write(s, r, sizeof(*r));
 
-    char buf[512] = {0};
-    read(sock, buf, sizeof(buf));
+    char buf[4096];
+    int n;
+    while ((n = read(s, buf, sizeof(buf))) > 0)
+        write(1, buf, n);
 
-    printf("%s", buf);
-
-    close(sock);
-    return 0;
+    close(s);
 }
 
 /* ================= MAIN ================= */
@@ -385,35 +271,27 @@ int main(int argc, char *argv[]) {
 
     if (argc < 2) return 1;
 
-    if (strcmp(argv[1], "supervisor") == 0) {
-        run_supervisor();
+    if (!strcmp(argv[1], "supervisor")) {
+        supervisor();
         return 0;
     }
 
-    request_t req = {0};
+    request_t r;
+    memset(&r, 0, sizeof(r));
 
-    if (strcmp(argv[1], "start") == 0)
-        req.type = CMD_START;
-    else if (strcmp(argv[1], "run") == 0)
-        req.type = CMD_RUN;
-    else if (strcmp(argv[1], "ps") == 0)
-        req.type = CMD_PS;
-    else if (strcmp(argv[1], "stop") == 0)
-        req.type = CMD_STOP;
-    else if (strcmp(argv[1], "logs") == 0)
-        req.type = CMD_LOGS;
+    if (!strcmp(argv[1], "start")) r.cmd = CMD_START;
+    else if (!strcmp(argv[1], "ps")) r.cmd = CMD_PS;
+    else if (!strcmp(argv[1], "stop")) r.cmd = CMD_STOP;
+    else if (!strcmp(argv[1], "logs")) r.cmd = CMD_LOGS;
 
-    if (req.type != CMD_PS) {
-        strcpy(req.id, argv[2]);
+    if (r.cmd != CMD_PS)
+        strcpy(r.id, argv[2]);
+
+    if (r.cmd == CMD_START) {
+        strcpy(r.rootfs, argv[3]);
+        strcpy(r.command, argv[4]);
     }
 
-    if (req.type == CMD_START || req.type == CMD_RUN) {
-        strcpy(req.rootfs, argv[3]);
-        strcpy(req.command, argv[4]);
-    }
-
-    req.soft = 40UL << 20;
-    req.hard = 64UL << 20;
-
-    return send_request(&req);
+    send_req(&r);
+    return 0;
 }

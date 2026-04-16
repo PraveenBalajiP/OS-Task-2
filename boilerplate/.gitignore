@@ -1,0 +1,15 @@
+# container rootfs (VERY IMPORTANT)
+boilerplate/rootfs/
+rootfs/
+
+# logs
+logs/
+
+# build output
+*.out
+*.o
+
+# system mounts (if accidentally inside)
+proc/
+sys/
+dev/
