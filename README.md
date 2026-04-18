@@ -24,6 +24,8 @@ These two components communicate via `ioctl` calls through a shared interface de
 
 ---
 
+![Overview](1.png)
+
 ## ⚙️ Requirements
 
 Before you begin, make sure your environment meets the following requirements:
@@ -37,6 +39,11 @@ Before you begin, make sure your environment meets the following requirements:
 | Kernel headers | Must match your currently running kernel version |
 
 ---
+
+![Requirements 1](2.1.jpeg)
+![Requirements 2](2.2.jpeg)
+![Requirements 3](2.3.jpeg)
+![Requirements 4](2.4.jpeg)
 
 ### ⬇️ Installing Dependencies
 
@@ -59,6 +66,9 @@ ls /lib/modules/$(uname -r)/build
 The last command should print a valid path without errors, confirming kernel headers are in place.
 
 ---
+
+![Installing Dependencies 1](3.1.png)
+![Installing Dependencies 2](3.2.png)
 
 ## 📁 Project Structure
 
@@ -87,6 +97,8 @@ boilerplate/
 - **`rootfs-*/`** — These are minimal Linux root filesystems (containing `/bin`, `/lib`, etc.) that serve as the isolated environment for each container. You can create one using `debootstrap` or by extracting a minimal Alpine Linux tarball.
 
 ---
+
+![Project Structure](4.png)
 
 ## 🧠 Architecture
 
@@ -124,6 +136,8 @@ Mixing these two would complicate the supervisor logic and make it harder to sca
 
 ---
 
+![Architecture](5.png)
+
 ## 🔄 System Working
 
 ### 1. Container Creation
@@ -138,6 +152,8 @@ When you run `./engine start <id> <rootfs> "<command>"`, the supervisor does the
 4. Sets up a pipe before `clone()` so the supervisor can read the container's stdout/stderr and write it to the log file.
 
 > **Note:** `CLONE_NEWPID` (PID namespace) is intentionally **not used** because it can cause kernel panics in certain VM configurations. See the Design Decisions section for details.
+
+![Container Creation](6.png)
 
 ### 2. Supervisor Daemon
 
@@ -155,6 +171,8 @@ The supervisor is the central component of the runtime. Here is what happens whe
 
 The supervisor must remain running in a terminal for CLI commands to work. Without it, there is nothing listening on the socket and all CLI commands will fail.
 
+![Supervisor Daemon](7.png)
+
 ### 3. Logging (Path A — Pipes)
 
 Before creating a container, the supervisor calls `pipe()` to create a read-write file descriptor pair.
@@ -171,6 +189,8 @@ To view logs at any time:
 ```
 
 This sends a `logs` command to the supervisor over the UNIX socket, and the supervisor reads and returns the content of the corresponding log file.
+
+![Logging](8.png)
 
 ### 4. Control Plane (Path B — UNIX Socket)
 
