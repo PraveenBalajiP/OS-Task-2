@@ -400,7 +400,75 @@ Together, these techniques form the foundation of how container platforms like D
 
 ---
 
-## 👨‍💻 Author
+## � Screenshots
+
+### Task 1
+
+![Task 1](OS-TASK/1.png)
+
+*Caption: Demonstration of running multiple containers concurrently using the supervisor.*
+
+### Task 2
+
+![Task 2.1](OS-TASK/2.1.jpeg)
+
+*Caption: CLI command to start a new container with specified parameters.*
+
+![Task 2.2](OS-TASK/2.2.jpeg)
+
+*Caption: Output of the 'ps' command listing all running containers.*
+
+![Task 2.3](OS-TASK/2.3.jpeg)
+
+*Caption: Stopping a running container via the CLI.*
+
+![Task 2.4](OS-TASK/2.4.jpeg)
+
+*Caption: Viewing logs of a specific container.*
+
+### Task 3
+
+![Task 3.1](OS-TASK/3.1.png)
+
+*Caption: Logging system capturing stdout and stderr from containers.*
+
+![Task 3.3](OS-TASK/3.3.png)
+
+*Caption: Bounded-buffer logging pipeline in action.*
+
+### Task 4
+
+![Task 4](OS-TASK/4.png)
+
+*Caption: Kernel memory monitor enforcing soft and hard limits.*
+
+### Task 5
+
+![Task 5](OS-TASK/5.png)
+
+*Caption: Scheduler experiments comparing CPU-bound and I/O-bound workloads.*
+
+### Task 6
+
+![Task 6](OS-TASK/6.png)
+
+*Caption: Resource cleanup and teardown verification.*
+
+### Task 7
+
+![Task 7](OS-TASK/7.png)
+
+*Caption: Additional testing and validation of container isolation.*
+
+### Task 8
+
+![Task 8](OS-TASK/8.png)
+
+*Caption: Final demonstration of the complete system in operation.*
+
+---
+
+## �👨‍💻 Author
 
 **Praveen Balaji P**
 
