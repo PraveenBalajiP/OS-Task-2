@@ -380,7 +380,51 @@ Together, these techniques form the foundation of how container platforms like D
 
 ---
 
-## 👨‍💻 Author
+## � Screenshots
+
+### Task 1
+
+![Task 1](OS-TASK/1.png)
+
+### Task 2
+
+![Task 2.1](OS-TASK/2.1.jpeg)
+
+![Task 2.2](OS-TASK/2.2.jpeg)
+
+![Task 2.3](OS-TASK/2.3.jpeg)
+
+![Task 2.4](OS-TASK/2.4.jpeg)
+
+### Task 3
+
+![Task 3.1](OS-TASK/3.1.png)
+
+![Task 3.3](OS-TASK/3.3.png)
+
+### Task 4
+
+![Task 4](OS-TASK/4.png)
+
+### Task 5
+
+![Task 5](OS-TASK/5.png)
+
+### Task 6
+
+![Task 6](OS-TASK/6.png)
+
+### Task 7
+
+![Task 7](OS-TASK/7.png)
+
+### Task 8
+
+![Task 8](OS-TASK/8.png)
+
+---
+
+## �👨‍💻 Author
 
 **Praveen Balaji P**
 
